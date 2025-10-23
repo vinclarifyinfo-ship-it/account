@@ -1,3 +1,4 @@
+// server.js (updated)
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
@@ -13,35 +14,67 @@ let paymentIntents = [];
 
 // Airwallex Configuration
 const AIRWALLEX_CONFIG = {
-    BASE_URL: process.env.AIRWALLEX_ENV === 'production' 
-        ? 'https://api.airwallex.com' 
+    BASE_URL: process.env.AIRWALLEX_ENV === 'production'
+        ? 'https://api.airwallex.com'
         : 'https://api-demo.airwallex.com',
     API_KEY: process.env.AIRWALLEX_API_KEY,
     CLIENT_ID: process.env.AIRWALLEX_CLIENT_ID
 };
 
+console.log('🔎 Airwallex config:', {
+    BASE_URL: AIRWALLEX_CONFIG.BASE_URL,
+    CLIENT_ID_SNIPPET: AIRWALLEX_CONFIG.CLIENT_ID ? `${AIRWALLEX_CONFIG.CLIENT_ID.slice(0,6)}...${AIRWALLEX_CONFIG.CLIENT_ID.slice(-4)}` : null,
+    USING_REAL_KEYS: !!(AIRWALLEX_CONFIG.API_KEY && AIRWALLEX_CONFIG.CLIENT_ID)
+});
+
+// Helper to read response safely
+async function safeReadResponse(response) {
+    const text = await response.text().catch(() => '');
+    try {
+        return JSON.parse(text);
+    } catch {
+        return text;
+    }
+}
+
 // Get Airwallex Authentication Token
 async function getAirwallexToken() {
     try {
-        const response = await fetch(`${AIRWALLEX_CONFIG.BASE_URL}/api/v1/authentication/login`, {
+        const url = `${AIRWALLEX_CONFIG.BASE_URL}/api/v1/authentication/login`;
+        const response = await fetch(url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
+                // Airwallex expects credentials in headers for the login endpoint
+                'x-client-id': AIRWALLEX_CONFIG.CLIENT_ID,
+                'x-api-key': AIRWALLEX_CONFIG.API_KEY
             },
-            body: JSON.stringify({
-                client_id: AIRWALLEX_CONFIG.CLIENT_ID,
-                api_key: AIRWALLEX_CONFIG.API_KEY
-            })
+            // Body is intentionally empty — credentials are in headers
+            body: JSON.stringify({})
         });
 
         if (!response.ok) {
-            throw new Error(`Authentication failed: ${response.status}`);
+            const body = await safeReadResponse(response);
+            console.error('❌ Airwallex auth failed response:', {
+                status: response.status,
+                body
+            });
+            throw new Error(`Authentication failed: ${response.status} - ${typeof body === 'string' ? body : JSON.stringify(body)}`);
         }
 
         const data = await response.json();
-        return data.token;
+
+        // Sanity: check token field
+        const token = data && (data.token || data.access_token || data.data && data.data.token);
+        if (!token) {
+            console.error('❌ Airwallex auth succeeded but token missing:', data);
+            throw new Error('Authentication succeeded but token missing in response');
+        }
+
+        console.log('✅ Airwallex token generated');
+        return token;
     } catch (error) {
-        console.error('Airwallex authentication error:', error);
+        console.error('Airwallex authentication error:', error.message || error);
         throw error;
     }
 }
@@ -57,7 +90,7 @@ app.post('/api/create-payment-intent', async (req, res) => {
             plan: plan,
             vin: vin,
             orderId: orderId,
-            customer: customer.email
+            customer: customer && customer.email
         });
 
         // Validate required fields
@@ -74,7 +107,7 @@ app.post('/api/create-payment-intent', async (req, res) => {
         // REAL AIRWALLEX INTEGRATION
         try {
             const token = await getAirwallexToken();
-            
+
             const paymentIntent = await createAirwallexPaymentIntent(amount, currency, customer, plan, vin, orderId, token);
 
             // Store payment intent locally
@@ -103,23 +136,24 @@ app.post('/api/create-payment-intent', async (req, res) => {
             res.json(localPaymentIntent);
 
         } catch (airwallexError) {
-            console.error('Airwallex API Error:', airwallexError);
-            // Fallback to simulation mode
+            console.error('Airwallex API Error (create intent):', airwallexError.message || airwallexError);
+            // Fallback to simulation mode (so your frontend still works)
             return createSimulatedPaymentIntent(req, res);
         }
 
     } catch (error) {
         console.error('Error creating payment intent:', error);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Failed to create payment intent',
-            details: error.message 
+            details: error.message
         });
     }
 });
 
 // Create Airwallex Payment Intent
 async function createAirwallexPaymentIntent(amount, currency, customer, plan, vin, orderId, token) {
-    const response = await fetch(`${AIRWALLEX_CONFIG.BASE_URL}/api/v1/pa/payment_intents/create`, {
+    const url = `${AIRWALLEX_CONFIG.BASE_URL}/api/v1/pa/payment_intents/create`;
+    const response = await fetch(url, {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${token}`,
@@ -144,8 +178,12 @@ async function createAirwallexPaymentIntent(amount, currency, customer, plan, vi
     });
 
     if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || `Airwallex API error: ${response.status}`);
+        const errBody = await safeReadResponse(response);
+        console.error('❌ createAirwallexPaymentIntent failed:', {
+            status: response.status,
+            body: errBody
+        });
+        throw new Error(errBody && (errBody.message || JSON.stringify(errBody)) || `Airwallex API error: ${response.status}`);
     }
 
     return await response.json();
@@ -156,10 +194,14 @@ app.post('/api/confirm-payment', async (req, res) => {
     try {
         const { paymentIntentId, paymentMethod } = req.body;
 
+        if (!paymentIntentId || !paymentMethod) {
+            return res.status(400).json({ error: 'Missing paymentIntentId or paymentMethod' });
+        }
+
         console.log('🔐 Payment Confirmation Request:', {
             paymentIntentId: paymentIntentId,
-            cardLast4: paymentMethod.card.number.slice(-4),
-            customer: paymentMethod.billing.email
+            cardLast4: paymentMethod.card && paymentMethod.card.number ? paymentMethod.card.number.slice(-4) : null,
+            customer: paymentMethod.billing && paymentMethod.billing.email ? paymentMethod.billing.email : null
         });
 
         // Find the payment intent
@@ -185,10 +227,13 @@ app.post('/api/confirm-payment', async (req, res) => {
             const token = await getAirwallexToken();
             const paymentResult = await confirmAirwallexPayment(paymentIntentId, paymentMethod, token);
 
-            if (paymentResult.status === 'SUCCEEDED') {
+            // Airwallex may respond with different status keys; normalize check
+            const status = (paymentResult.status || paymentResult.payment_status || '').toUpperCase();
+
+            if (status === 'SUCCEEDED' || status === 'SUCCESS' || status === 'CAPTURED') {
                 // Store successful payment
                 const paymentRecord = {
-                    id: paymentResult.id,
+                    id: paymentResult.id || `pay_${Date.now()}`,
                     payment_intent_id: paymentIntentId,
                     status: 'succeeded',
                     amount: paymentIntent.amount,
@@ -205,13 +250,13 @@ app.post('/api/confirm-payment', async (req, res) => {
                 payments.push(paymentRecord);
 
                 console.log('✅ REAL Payment Successful:', {
-                    paymentId: paymentResult.id,
+                    paymentId: paymentRecord.id,
                     amount: paymentIntent.amount,
                     customer: paymentIntent.customer.email
                 });
 
                 return res.json({
-                    id: paymentResult.id,
+                    id: paymentRecord.id,
                     status: 'succeeded',
                     amount: paymentIntent.amount,
                     currency: paymentIntent.currency,
@@ -220,32 +265,33 @@ app.post('/api/confirm-payment', async (req, res) => {
                     timestamp: new Date().toISOString()
                 });
             } else {
-                console.log('❌ Payment Failed:', paymentResult);
-                return res.status(400).json({ 
+                console.log('❌ Payment Failed/Not Succeeded:', paymentResult);
+                return res.status(400).json({
                     error: 'Payment processing failed',
-                    status: paymentResult.status
+                    status: paymentResult.status || paymentResult
                 });
             }
         } catch (airwallexError) {
-            console.error('Airwallex Payment Error:', airwallexError);
-            return res.status(500).json({ 
+            console.error('Airwallex Payment Error (confirm):', airwallexError.message || airwallexError);
+            return res.status(500).json({
                 error: 'Payment gateway error',
-                details: airwallexError.message 
+                details: airwallexError.message
             });
         }
 
     } catch (error) {
         console.error('Error confirming payment:', error);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Failed to confirm payment',
-            details: error.message 
+            details: error.message
         });
     }
 });
 
 // Confirm Airwallex Payment
 async function confirmAirwallexPayment(paymentIntentId, paymentMethod, token) {
-    const response = await fetch(`${AIRWALLEX_CONFIG.BASE_URL}/api/v1/pa/payment_intents/${paymentIntentId}/confirm`, {
+    const url = `${AIRWALLEX_CONFIG.BASE_URL}/api/v1/pa/payment_intents/${paymentIntentId}/confirm`;
+    const response = await fetch(url, {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${token}`,
@@ -267,14 +313,18 @@ async function confirmAirwallexPayment(paymentIntentId, paymentMethod, token) {
                 last_name: paymentMethod.billing.last_name,
                 email: paymentMethod.billing.email
             },
-            metadata: paymentMethod.metadata,
+            metadata: paymentMethod.metadata || {},
             request_id: `confirm_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
         })
     });
 
     if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || `Airwallex confirmation error: ${response.status}`);
+        const errBody = await safeReadResponse(response);
+        console.error('❌ confirmAirwallexPayment failed:', {
+            status: response.status,
+            body: errBody
+        });
+        throw new Error(errBody && (errBody.message || JSON.stringify(errBody)) || `Airwallex confirmation error: ${response.status}`);
     }
 
     return await response.json();
@@ -283,7 +333,7 @@ async function confirmAirwallexPayment(paymentIntentId, paymentMethod, token) {
 // Simulation functions (same as before)
 async function createSimulatedPaymentIntent(req, res) {
     const { amount, currency, plan, vin, orderId, customer } = req.body;
-    
+
     const paymentIntent = {
         id: 'pi_sim_' + Math.random().toString(36).substr(2, 9),
         client_secret: 'pi_sim_' + Math.random().toString(36).substr(2, 9) + '_secret',
@@ -343,10 +393,9 @@ async function processSimulatedPayment(paymentIntent, paymentMethod, res) {
 
 // Rest of the code remains same...
 function validateCardDetails(card) {
-    // Same validation function as before
     const { number, exp_month, exp_year, cvc } = card;
     const cleanNumber = number.replace(/\s/g, '');
-    
+
     if (!cleanNumber || cleanNumber.length < 15 || cleanNumber.length > 19) {
         return 'Invalid card number';
     }
@@ -366,7 +415,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`💰 Payment Receiver running on port ${PORT}`);
     console.log(`🌐 Environment: ${process.env.AIRWALLEX_ENV || 'demo'}`);
-    
+
     if (!process.env.AIRWALLEX_API_KEY || !process.env.AIRWALLEX_CLIENT_ID) {
         console.log('⚠️  SIMULATION MODE: Airwallex credentials not found');
         console.log('💡 Add AIRWALLEX_API_KEY and AIRWALLEX_CLIENT_ID to environment variables for real payments');
