@@ -1,4 +1,4 @@
-// server.js (updated)
+// server.js (with HPP fallback)
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
@@ -45,11 +45,9 @@ async function getAirwallexToken() {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                // Airwallex expects credentials in headers for the login endpoint
                 'x-client-id': AIRWALLEX_CONFIG.CLIENT_ID,
                 'x-api-key': AIRWALLEX_CONFIG.API_KEY
             },
-            // Body is intentionally empty — credentials are in headers
             body: JSON.stringify({})
         });
 
@@ -63,8 +61,6 @@ async function getAirwallexToken() {
         }
 
         const data = await response.json();
-
-        // Sanity: check token field
         const token = data && (data.token || data.access_token || data.data && data.data.token);
         if (!token) {
             console.error('❌ Airwallex auth succeeded but token missing:', data);
@@ -79,74 +75,98 @@ async function getAirwallexToken() {
     }
 }
 
-// Create payment intent with proper authentication
+// Create payment intent
 app.post('/api/create-payment-intent', async (req, res) => {
     try {
         const { amount, currency, plan, vin, orderId, customer } = req.body;
 
         console.log('💰 Payment Intent Request:', {
-            amount: amount,
-            currency: currency,
-            plan: plan,
-            vin: vin,
-            orderId: orderId,
-            customer: customer && customer.email
+            amount, currency, plan, vin, orderId, customer: customer && customer.email
         });
 
-        // Validate required fields
         if (!amount || !customer || !customer.email) {
             return res.status(400).json({ error: 'Missing required fields' });
         }
 
-        // Check if Airwallex credentials are configured
+        // Simulation if missing credentials
         if (!AIRWALLEX_CONFIG.API_KEY || !AIRWALLEX_CONFIG.CLIENT_ID) {
             console.log('⚠️ Airwallex credentials not configured - using simulation mode');
             return createSimulatedPaymentIntent(req, res);
         }
 
-        // REAL AIRWALLEX INTEGRATION
         try {
             const token = await getAirwallexToken();
-
             const paymentIntent = await createAirwallexPaymentIntent(amount, currency, customer, plan, vin, orderId, token);
 
-            // Store payment intent locally
             const localPaymentIntent = {
                 id: paymentIntent.id,
                 client_secret: paymentIntent.client_secret,
-                amount: amount,
+                amount,
                 currency: currency || 'USD',
                 status: paymentIntent.status,
-                plan: plan,
-                vin: vin,
-                orderId: orderId,
-                customer: customer,
+                plan,
+                vin,
+                orderId,
+                customer,
                 created_at: new Date().toISOString(),
                 simulation: false
             };
-
             paymentIntents.push(localPaymentIntent);
 
             console.log('💰 REAL Payment Intent Created:', {
                 paymentIntentId: paymentIntent.id,
-                amount: amount,
+                amount,
                 customer: customer.email
             });
 
             res.json(localPaymentIntent);
-
         } catch (airwallexError) {
             console.error('Airwallex API Error (create intent):', airwallexError.message || airwallexError);
-            // Fallback to simulation mode (so your frontend still works)
+
+            // 3️⃣ Hosted Payment Page Fallback
+            try {
+                const token = await getAirwallexToken();
+                const hppUrl = `${AIRWALLEX_CONFIG.BASE_URL}/api/v1/pa/payment_intents/create`;
+                const hppResponse = await fetch(hppUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        amount: Math.round(amount),
+                        currency: currency || 'USD',
+                        merchant_order_id: orderId || `order_${Date.now()}`,
+                        customer: {
+                            email: customer.email,
+                            first_name: customer.firstName,
+                            last_name: customer.lastName
+                        },
+                        metadata: { plan, vin, order_id: orderId },
+                        request_id: `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                        payment_method: { type: 'card' },
+                        next_action: {
+                            type: 'redirect',
+                            return_url: 'https://vinclarify.info/thankyou'
+                        }
+                    })
+                });
+
+                const hppData = await safeReadResponse(hppResponse);
+                if (hppData.next_action && hppData.next_action.redirect_url) {
+                    console.log('🌐 Hosted Payment Page Redirect URL:', hppData.next_action.redirect_url);
+                    return res.json({ redirect_url: hppData.next_action.redirect_url });
+                }
+            } catch (hppError) {
+                console.error('Hosted Payment Page fallback failed:', hppError);
+            }
+
+            // Still fallback to simulation if all else fails
             return createSimulatedPaymentIntent(req, res);
         }
-
     } catch (error) {
         console.error('Error creating payment intent:', error);
-        res.status(500).json({
-            error: 'Failed to create payment intent',
-            details: error.message
-        });
+        res.status(500).json({ error: 'Failed to create payment intent', details: error.message });
     }
 });
 
@@ -168,28 +188,21 @@ async function createAirwallexPaymentIntent(amount, currency, customer, plan, vi
                 first_name: customer.firstName,
                 last_name: customer.lastName
             },
-            metadata: {
-                plan: plan,
-                vin: vin,
-                order_id: orderId
-            },
+            metadata: { plan, vin, order_id: orderId },
             request_id: `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
         })
     });
 
     if (!response.ok) {
         const errBody = await safeReadResponse(response);
-        console.error('❌ createAirwallexPaymentIntent failed:', {
-            status: response.status,
-            body: errBody
-        });
+        console.error('❌ createAirwallexPaymentIntent failed:', { status: response.status, body: errBody });
         throw new Error(errBody && (errBody.message || JSON.stringify(errBody)) || `Airwallex API error: ${response.status}`);
     }
 
     return await response.json();
 }
 
-// Confirm payment with Airwallex
+// Confirm payment
 app.post('/api/confirm-payment', async (req, res) => {
     try {
         const { paymentIntentId, paymentMethod } = req.body;
@@ -199,92 +212,60 @@ app.post('/api/confirm-payment', async (req, res) => {
         }
 
         console.log('🔐 Payment Confirmation Request:', {
-            paymentIntentId: paymentIntentId,
+            paymentIntentId,
             cardLast4: paymentMethod.card && paymentMethod.card.number ? paymentMethod.card.number.slice(-4) : null,
             customer: paymentMethod.billing && paymentMethod.billing.email ? paymentMethod.billing.email : null
         });
 
-        // Find the payment intent
         const paymentIntent = paymentIntents.find(pi => pi.id === paymentIntentId);
-        if (!paymentIntent) {
-            return res.status(404).json({ error: 'Payment intent not found' });
-        }
+        if (!paymentIntent) return res.status(404).json({ error: 'Payment intent not found' });
 
-        // Validate card details
         const validationError = validateCardDetails(paymentMethod.card);
-        if (validationError) {
-            return res.status(400).json({ error: validationError });
-        }
+        if (validationError) return res.status(400).json({ error: validationError });
 
-        // Check if we have Airwallex credentials
         if (!AIRWALLEX_CONFIG.API_KEY || !AIRWALLEX_CONFIG.CLIENT_ID) {
             console.log('🔐 SIMULATION Payment Processing');
             return processSimulatedPayment(paymentIntent, paymentMethod, res);
         }
 
-        // REAL AIRWALLEX PAYMENT PROCESSING
-        try {
-            const token = await getAirwallexToken();
-            const paymentResult = await confirmAirwallexPayment(paymentIntentId, paymentMethod, token);
+        const token = await getAirwallexToken();
+        const paymentResult = await confirmAirwallexPayment(paymentIntentId, paymentMethod, token);
+        const status = (paymentResult.status || paymentResult.payment_status || '').toUpperCase();
 
-            // Airwallex may respond with different status keys; normalize check
-            const status = (paymentResult.status || paymentResult.payment_status || '').toUpperCase();
+        if (status === 'SUCCEEDED' || status === 'SUCCESS' || status === 'CAPTURED') {
+            const paymentRecord = {
+                id: paymentResult.id || `pay_${Date.now()}`,
+                payment_intent_id: paymentIntentId,
+                status: 'succeeded',
+                amount: paymentIntent.amount,
+                currency: paymentIntent.currency,
+                plan: paymentIntent.plan,
+                vin: paymentIntent.vin,
+                order_id: paymentIntent.orderId,
+                customer_email: paymentIntent.customer.email,
+                card_last4: paymentMethod.card.number.slice(-4),
+                simulation: false,
+                created_at: new Date().toISOString()
+            };
+            payments.push(paymentRecord);
+            console.log('✅ REAL Payment Successful:', { paymentId: paymentRecord.id, amount: paymentIntent.amount, customer: paymentIntent.customer.email });
 
-            if (status === 'SUCCEEDED' || status === 'SUCCESS' || status === 'CAPTURED') {
-                // Store successful payment
-                const paymentRecord = {
-                    id: paymentResult.id || `pay_${Date.now()}`,
-                    payment_intent_id: paymentIntentId,
-                    status: 'succeeded',
-                    amount: paymentIntent.amount,
-                    currency: paymentIntent.currency,
-                    plan: paymentIntent.plan,
-                    vin: paymentIntent.vin,
-                    order_id: paymentIntent.orderId,
-                    customer_email: paymentIntent.customer.email,
-                    card_last4: paymentMethod.card.number.slice(-4),
-                    simulation: false,
-                    created_at: new Date().toISOString()
-                };
-
-                payments.push(paymentRecord);
-
-                console.log('✅ REAL Payment Successful:', {
-                    paymentId: paymentRecord.id,
-                    amount: paymentIntent.amount,
-                    customer: paymentIntent.customer.email
-                });
-
-                return res.json({
-                    id: paymentRecord.id,
-                    status: 'succeeded',
-                    amount: paymentIntent.amount,
-                    currency: paymentIntent.currency,
-                    payment_method: 'card',
-                    card_last4: paymentMethod.card.number.slice(-4),
-                    timestamp: new Date().toISOString()
-                });
-            } else {
-                console.log('❌ Payment Failed/Not Succeeded:', paymentResult);
-                return res.status(400).json({
-                    error: 'Payment processing failed',
-                    status: paymentResult.status || paymentResult
-                });
-            }
-        } catch (airwallexError) {
-            console.error('Airwallex Payment Error (confirm):', airwallexError.message || airwallexError);
-            return res.status(500).json({
-                error: 'Payment gateway error',
-                details: airwallexError.message
+            return res.json({
+                id: paymentRecord.id,
+                status: 'succeeded',
+                amount: paymentIntent.amount,
+                currency: paymentIntent.currency,
+                payment_method: 'card',
+                card_last4: paymentMethod.card.number.slice(-4),
+                timestamp: new Date().toISOString()
             });
+        } else {
+            console.log('❌ Payment Failed/Not Succeeded:', paymentResult);
+            return res.status(400).json({ error: 'Payment processing failed', status: paymentResult.status || paymentResult });
         }
-
     } catch (error) {
         console.error('Error confirming payment:', error);
-        res.status(500).json({
-            error: 'Failed to confirm payment',
-            details: error.message
-        });
+        res.status(500).json({ error: 'Failed to confirm payment', details: error.message });
     }
 });
 
@@ -320,42 +301,22 @@ async function confirmAirwallexPayment(paymentIntentId, paymentMethod, token) {
 
     if (!response.ok) {
         const errBody = await safeReadResponse(response);
-        console.error('❌ confirmAirwallexPayment failed:', {
-            status: response.status,
-            body: errBody
-        });
+        console.error('❌ confirmAirwallexPayment failed:', { status: response.status, body: errBody });
         throw new Error(errBody && (errBody.message || JSON.stringify(errBody)) || `Airwallex confirmation error: ${response.status}`);
     }
 
     return await response.json();
 }
 
-// Simulation functions (same as before)
+// --- Simulation mode handlers ---
 async function createSimulatedPaymentIntent(req, res) {
     const { amount, currency, plan, vin, orderId, customer } = req.body;
-
     const paymentIntent = {
         id: 'pi_sim_' + Math.random().toString(36).substr(2, 9),
         client_secret: 'pi_sim_' + Math.random().toString(36).substr(2, 9) + '_secret',
-        amount: amount,
-        currency: currency || 'USD',
-        status: 'requires_payment_method'
+        amount, currency: currency || 'USD', status: 'requires_payment_method'
     };
-
-    const localPaymentIntent = {
-        id: paymentIntent.id,
-        client_secret: paymentIntent.client_secret,
-        amount: amount,
-        currency: currency || 'USD',
-        status: paymentIntent.status,
-        plan: plan,
-        vin: vin,
-        orderId: orderId,
-        customer: customer,
-        created_at: new Date().toISOString(),
-        simulation: true
-    };
-
+    const localPaymentIntent = { ...paymentIntent, plan, vin, orderId, customer, created_at: new Date().toISOString(), simulation: true };
     paymentIntents.push(localPaymentIntent);
     res.json(localPaymentIntent);
 }
@@ -371,7 +332,6 @@ async function processSimulatedPayment(paymentIntent, paymentMethod, res) {
         timestamp: new Date().toISOString(),
         simulation: true
     };
-
     const paymentRecord = {
         id: paymentResult.id,
         payment_intent_id: paymentIntent.id,
@@ -386,28 +346,18 @@ async function processSimulatedPayment(paymentIntent, paymentMethod, res) {
         simulation: true,
         created_at: new Date().toISOString()
     };
-
     payments.push(paymentRecord);
     res.json(paymentResult);
 }
 
-// Rest of the code remains same...
 function validateCardDetails(card) {
     const { number, exp_month, exp_year, cvc } = card;
     const cleanNumber = number.replace(/\s/g, '');
-
-    if (!cleanNumber || cleanNumber.length < 15 || cleanNumber.length > 19) {
-        return 'Invalid card number';
-    }
-
-    const currentDate = new Date();
-    const currentYear = currentDate.getFullYear();
-    const currentMonth = currentDate.getMonth() + 1;
-
+    if (!cleanNumber || cleanNumber.length < 15 || cleanNumber.length > 19) return 'Invalid card number';
+    const now = new Date(), y = now.getFullYear(), m = now.getMonth() + 1;
     if (exp_month < 1 || exp_month > 12) return 'Invalid expiry month';
-    if (exp_year < currentYear || (exp_year === currentYear && exp_month < currentMonth)) return 'Card expired';
+    if (exp_year < y || (exp_year === y && exp_month < m)) return 'Card expired';
     if (!cvc || cvc.length < 3 || cvc.length > 4) return 'Invalid CVV';
-
     return null;
 }
 
@@ -415,11 +365,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`💰 Payment Receiver running on port ${PORT}`);
     console.log(`🌐 Environment: ${process.env.AIRWALLEX_ENV || 'demo'}`);
-
     if (!process.env.AIRWALLEX_API_KEY || !process.env.AIRWALLEX_CLIENT_ID) {
-        console.log('⚠️  SIMULATION MODE: Airwallex credentials not found');
-        console.log('💡 Add AIRWALLEX_API_KEY and AIRWALLEX_CLIENT_ID to environment variables for real payments');
-    } else {
-        console.log('✅ REAL PAYMENT MODE: Airwallex credentials configured');
-    }
+        console.log('⚠️ SIMULATION MODE: credentials missing');
+    } else console.log('✅ REAL PAYMENT MODE: Airwallex credentials configured');
 });
