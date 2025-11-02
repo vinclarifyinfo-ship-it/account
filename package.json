@@ -2,12 +2,14 @@
   "name": "truecarvin-payment-receiver",
   "version": "1.0.0",
   "description": "Simple payment receiver for Airwallex",
+  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
   "dependencies": {
+    "axios": "^1.6.0",
     "body-parser": "^1.20.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
