@@ -7,7 +7,7 @@ app.use(cors());
 app.use(express.json());
 
 // ✅ Replace this with your live Airwallex API Key
-const AIRWALLEX_API_KEY = "YOUR_LIVE_API_KEY";
+const AIRWALLEX_API_KEY = "3a87b90852bfe38eaba7c024e49e6ae83cefacd8fab6615fba5581a2f8299eab5795c7e0a3c78dcee5029c0dec03d524";
 
 // ✅ Airwallex Base URL
 const AIRWALLEX_BASE_URL = "https://api.airwallex.com/api/v1";
