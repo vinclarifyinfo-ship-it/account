@@ -6,28 +6,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const AIRWALLEX_API_KEY = "YOUR_API_KEY";
+// ✅ Replace this with your live Airwallex API Key
+const AIRWALLEX_API_KEY = "YOUR_LIVE_API_KEY";
+
+// ✅ Airwallex Base URL
 const AIRWALLEX_BASE_URL = "https://api.airwallex.com/api/v1";
 
 app.post("/create-hpp", async (req, res) => {
   try {
-    const { amount, currency, name, email, return_url } = req.body;
+    const { amount, currency = "USD", name, email, return_url } = req.body;
 
-    const response = await axios.post(
+    if (!amount || !name || !email) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // 1️⃣ Create Payment Intent
+    const paymentIntentResponse = await axios.post(
       `${AIRWALLEX_BASE_URL}/pa/payment_intents/create`,
       {
         request_id: `req_${Date.now()}`,
-        amount: amount,
-        currency: currency || "USD",
+        amount,
+        currency,
         merchant_order_id: `order_${Date.now()}`,
-        payment_method_types: ["card"], // ✅ Correct usage
-        customer: {
-          email,
-          name,
-        },
-        metadata: {
-          source: "VIN Certification",
-        },
+        payment_method_types: ["card"],
+        customer: { name, email },
+        metadata: { source: "VIN Certification" },
       },
       {
         headers: {
@@ -37,13 +40,16 @@ app.post("/create-hpp", async (req, res) => {
       }
     );
 
-    // ✅ Now create Hosted Payment Page for that Payment Intent
+    // ✅ Log response for debugging
+    console.log("Payment Intent Response:", paymentIntentResponse.data);
+
+    // 2️⃣ Create Hosted Payment Page (HPP)
     const hppResponse = await axios.post(
       `${AIRWALLEX_BASE_URL}/pa/hosted_payment_page/create`,
       {
         request_id: `hpp_${Date.now()}`,
-        payment_intent_id: response.data.id,
-        merchant_order_id: response.data.merchant_order_id,
+        payment_intent_id: paymentIntentResponse.data.id,
+        merchant_order_id: paymentIntentResponse.data.merchant_order_id,
         return_url: return_url || "https://vincertification.com/thankyou",
       },
       {
@@ -54,12 +60,22 @@ app.post("/create-hpp", async (req, res) => {
       }
     );
 
+    console.log("HPP Response:", hppResponse.data);
+
     res.json({ url: hppResponse.data.url });
   } catch (error) {
-    console.error("Create HPP failed:", error.response?.data || error.message);
-    res.status(400).json({
-      error: error.response?.data || error.message,
-    });
+    // ✅ Better error logging
+    if (error.response) {
+      console.error("Airwallex API Error:", {
+        status: error.response.status,
+        headers: error.response.headers,
+        data: error.response.data,
+      });
+      return res.status(error.response.status).json({ error: error.response.data });
+    } else {
+      console.error("Unexpected Error:", error.message);
+      return res.status(500).json({ error: error.message });
+    }
   }
 });
 
