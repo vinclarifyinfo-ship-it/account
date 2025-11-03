@@ -1,10 +1,12 @@
-// server.js
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch'); // Ensure node-fetch installed
-const app = express();
+// server.js (ES Module version)
+import dotenv from 'dotenv';
+dotenv.config();
 
+import express from 'express';
+import cors from 'cors';
+import fetch from 'node-fetch'; // Ensure node-fetch v3+ installed
+
+const app = express();
 app.use(cors());
 app.use(express.json());
 
